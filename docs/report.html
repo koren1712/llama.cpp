@@ -18,7 +18,7 @@
 <body>
   <h1>Disk-backed Expert Streaming for Windows/CUDA</h1>
   <p>Status date: 2026-07-04</p>
-  <p>This report documents a local measurement campaign for GLM-4.5-Air Q4_K_M expert streaming in llama.cpp on a Windows/CUDA desktop. The optimized streaming path is measured on Windows/CUDA; non-Windows builds are untested. The branch adds file-offset registration for GGUF expert tensors, a persistent Windows read pool, pointer-returning streaming APIs, in-op read/compute overlap, slab-cache experiments, and VRAM expert spill experiments.</p>
+  <p>This report documents a local measurement campaign for GLM-4.5-Air Q4_K_M expert streaming in llama.cpp on a Windows/CUDA desktop. With <code>LLAMA_EXPERT_STREAMING</code> unset, the branch runs the stock path. The optimized streaming path is measured on Windows/CUDA; Linux and other non-Windows builds are untested. The branch adds file-offset registration for GGUF expert tensors, a persistent Windows read pool, pointer-returning streaming APIs, in-op read/compute overlap, slab-cache experiments, and VRAM expert spill experiments.</p>
 
   <h2>Hardware and Model</h2>
   <table>

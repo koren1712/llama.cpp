@@ -3,7 +3,7 @@
 This branch adds a disk-backed path for MoE expert tensors in `llama.cpp` on Windows/CUDA.
 It registers GGUF expert tensor file offsets, streams selected expert tensors through a persistent read pool, overlaps reads with `MUL_MAT_ID` expert consumption, and allows selected expert blocks to remain in VRAM through tensor overrides.
 The measurement target is GLM-4.5-Air Q4_K_M on a 32 GB RAM desktop.
-The optimized streaming path is measured on Windows/CUDA; non-Windows builds are untested.
+With `LLAMA_EXPERT_STREAMING` unset, the branch runs the stock path. The optimized streaming path is measured on Windows/CUDA; Linux and other non-Windows builds are untested.
 
 Base commit: `c8ae9a750 vendor : update cpp-httplib to 0.49.0 (#25218)`
 
