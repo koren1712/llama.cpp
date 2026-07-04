@@ -1558,6 +1558,11 @@ static void ggml_compute_forward_mul_mat_id(
     // row groups
     const int n_ids = ids->ne[0]; // n_expert_used
     const int n_as  = ne02;       // n_expert
+    const char * stream_env = getenv("LLAMA_EXPERT_STREAMING");
+    const bool stream_experts = stream_env && strcmp(stream_env, "0") != 0;
+    const char * stream_slots_env = getenv("LLAMA_EXPERT_STREAM_PREFETCH_SLOTS");
+    const int stream_slots_requested = stream_slots_env && stream_slots_env[0] ? atoi(stream_slots_env) : 16;
+    const int stream_slots = stream_experts ? MIN(n_as, MAX(1, stream_slots_requested)) : 0;
 
     void * wdata_cur = params->wdata;
 
@@ -1573,6 +1578,27 @@ static void ggml_compute_forward_mul_mat_id(
 
     char (*atomic_current_chunk)[CACHE_LINE_SIZE] = // [n_as]
         incr_ptr_aligned(&wdata_cur, CACHE_LINE_SIZE * n_as, CACHE_LINE_SIZE);
+
+    int * stream_expert_slot =
+        incr_ptr_aligned(&wdata_cur, n_as * sizeof(int), sizeof(int64_t));
+
+    int * stream_prefetch_experts =
+        incr_ptr_aligned(&wdata_cur, (size_t) stream_slots * sizeof(int), sizeof(int64_t));
+
+    int * stream_prefetch_ok =
+        incr_ptr_aligned(&wdata_cur, (size_t) stream_slots * sizeof(int), sizeof(int64_t));
+
+    size_t * stream_prefetch_offsets =
+        incr_ptr_aligned(&wdata_cur, (size_t) stream_slots * sizeof(size_t), sizeof(size_t));
+
+    const void ** stream_prefetch_ptrs =
+        incr_ptr_aligned(&wdata_cur, (size_t) stream_slots * sizeof(void *), sizeof(void *));
+
+    ggml_backend_tensor_stream_batch_t * stream_batch =
+        incr_ptr_aligned(&wdata_cur, sizeof(ggml_backend_tensor_stream_batch_t), sizeof(void *));
+
+    char * stream_prefetch =
+        incr_ptr_aligned(&wdata_cur, (size_t) stream_slots * nb02, CACHE_LINE_SIZE);
 
     GGML_ASSERT(params->wsize >= (size_t)((char *) wdata_cur - (char *) params->wdata));
 
@@ -1638,6 +1664,42 @@ static void ggml_compute_forward_mul_mat_id(
 
     ggml_barrier(params->threadpool);
 
+    if (stream_experts) {
+        if (ith == 0) {
+            *stream_batch = NULL;
+            for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+                stream_expert_slot[cur_a] = -1;
+            }
+
+            int prefetch_count = 0;
+            for (int cur_a = 0; cur_a < n_as && prefetch_count < stream_slots; ++cur_a) {
+                if (matrix_row_counts[cur_a] == 0) {
+                    continue;
+                }
+
+                stream_prefetch_experts[prefetch_count] = cur_a;
+                stream_prefetch_offsets[prefetch_count] = (size_t) cur_a * nb02;
+                prefetch_count++;
+            }
+
+            *stream_batch = ggml_backend_tensor_stream_read_many_ptr_async(
+                    src0,
+                    stream_prefetch_offsets,
+                    stream_prefetch,
+                    nb02,
+                    nb02,
+                    prefetch_count,
+                    stream_prefetch_ptrs,
+                    stream_prefetch_ok);
+
+            for (int i = 0; i < prefetch_count; ++i) {
+                stream_expert_slot[stream_prefetch_experts[i]] = i;
+            }
+        }
+
+        ggml_barrier(params->threadpool);
+    }
+
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];
 
@@ -1646,6 +1708,13 @@ static void ggml_compute_forward_mul_mat_id(
         }
 
         const char * src0_cur = (const char *) src0->data + cur_a * nb02;
+        if (stream_experts && stream_expert_slot[cur_a] >= 0) {
+            const int slot = stream_expert_slot[cur_a];
+            if (ggml_backend_tensor_stream_batch_wait(*stream_batch, slot)) {
+                src0_cur = (const char *) stream_prefetch_ptrs[slot];
+            }
+        }
+
         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
@@ -1697,6 +1766,16 @@ static void ggml_compute_forward_mul_mat_id(
 
             current_chunk = atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed);
         }
+
+    }
+
+    if (stream_experts) {
+        ggml_barrier(params->threadpool);
+        if (ith == 0 && *stream_batch != NULL) {
+            ggml_backend_tensor_stream_batch_free(*stream_batch);
+            *stream_batch = NULL;
+        }
+        ggml_barrier(params->threadpool);
     }
 }
 
@@ -2845,6 +2924,19 @@ struct ggml_cplan ggml_graph_plan(
                         cur += n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping) + sizeof(int64_t);
                         // atomic_current_chunk
                         cur += CACHE_LINE_SIZE*n_as + CACHE_LINE_SIZE;
+                        const char * stream_env = getenv("LLAMA_EXPERT_STREAMING");
+                        const bool stream_experts = stream_env && strcmp(stream_env, "0") != 0;
+                        const char * stream_slots_env = getenv("LLAMA_EXPERT_STREAM_PREFETCH_SLOTS");
+                        const int stream_slots_requested = stream_slots_env && stream_slots_env[0] ? atoi(stream_slots_env) : 16;
+                        const int stream_slots = stream_experts ? MIN(n_as, MAX(1, stream_slots_requested)) : 0;
+                        // streaming expert slot map + prefetched expert-sized staging buffers
+                        cur += n_as * sizeof(int) + sizeof(int64_t);
+                        cur += (size_t) stream_slots * sizeof(int) + sizeof(int64_t);
+                        cur += (size_t) stream_slots * sizeof(int) + sizeof(int64_t);
+                        cur += (size_t) stream_slots * sizeof(size_t) + sizeof(size_t);
+                        cur += (size_t) stream_slots * sizeof(void *) + sizeof(void *);
+                        cur += sizeof(ggml_backend_tensor_stream_batch_t) + sizeof(void *);
+                        cur += (size_t) stream_slots * src0->nb[2] + CACHE_LINE_SIZE;
                     } break;
                 case GGML_OP_OUT_PROD:
                     {

@@ -1,3 +1,160 @@
+# Disk-backed expert streaming for Windows/CUDA
+
+This branch adds a disk-backed path for MoE expert tensors in `llama.cpp` on Windows/CUDA.
+It registers GGUF expert tensor file offsets, streams selected expert tensors through a persistent read pool, overlaps reads with `MUL_MAT_ID` expert consumption, and allows selected expert blocks to remain in VRAM through tensor overrides.
+The measurement target is GLM-4.5-Air Q4_K_M on a 32 GB RAM desktop.
+The optimized streaming path is measured on Windows/CUDA; non-Windows builds are untested.
+
+Base commit: `c8ae9a750 vendor : update cpp-httplib to 0.49.0 (#25218)`
+
+Full campaign report: [docs/report.html](docs/report.html)
+
+## Measured Results
+
+Hardware:
+
+- CPU: Intel Core i7-8700K
+- GPU: NVIDIA GeForce RTX 4080 16 GB
+- RAM: 32 GB DDR4-2666
+- Storage: C: NVMe, WinSAT sequential read `2975.98 MB/s`, random read `456.74 MB/s`
+- Model: GLM-4.5-Air Q4_K_M, merged GGUF, `73.5 GB` file, `67.6 GB` expert tensor payload
+- Build: Windows, CUDA, Release, base commit `c8ae9a750`
+
+Command shape for the baseline and streaming variants:
+
+```powershell
+.\build-stream-cuda\bin\llama-completion.exe `
+  -m C:\llama\big-moe-q4.gguf `
+  -ngl 12 `
+  -ot "ffn_.*_exps=CPU" `
+  -c 4096 -n 32 -p "hi" `
+  --no-warmup --temp 0 -no-cnv --simple-io
+```
+
+| Variant | Setting | Speed |
+|---|---:|---:|
+| baseline mmap | stock path, expert tensors on CPU | `0.43 t/s` |
+| persistent async read pool | 8 workers, no slab | `0.65 t/s` |
+| pool depth sweep | 12 workers, no slab | `0.66 t/s` |
+| slab expert cache | 16 GiB zero-copy slab | `0.60 t/s` |
+| RAM-tier hybrid | 20 GiB demand-commit slab | `0.53 t/s` |
+| RAM-tier hybrid | 24 GiB slab | `0.12 t/s` |
+| in-op IO/compute overlap | 12 workers, no slab | `0.68 t/s` |
+| overlap + VRAM expert spill | expert blocks 0-3 pinned in VRAM | `0.75 t/s` |
+
+Best measured result:
+
+`0.75 / 0.43 = 1.74x`
+
+## IO Ladder
+
+| Measurement | Result |
+|---|---:|
+| observed mmap inference read rate | `377 MB/s` |
+| native 64 KiB random unbuffered read | `287 MB/s` |
+| native 16 MiB unbuffered read | `2.38 GB/s` |
+| best pure streaming in generation | `132.045 GB / 47.158 s = 2.80 GB/s` |
+| WinSAT sequential read | `2.98 GB/s` |
+
+The streaming path reached the NVMe bandwidth range during generation.
+The remaining wall is bytes per token: the best pure streaming run read `132.045 GB / 32 = 4.13 GB/token`.
+With four early expert blocks pinned in VRAM, disk traffic fell to `122.356 GB / 32 = 3.82 GB/token`.
+
+## Negative Results
+
+The cache variants reduced disk traffic but reduced end-to-end speed on this 32 GB RAM machine.
+
+| Variant | Disk bytes | Speed | Result |
+|---|---:|---:|---|
+| no slab, 12 workers | `132.045 GB` | `0.66 t/s` | baseline streaming |
+| 16 GiB slab | `76.025 GB` | `0.60 t/s` | less IO, slower |
+| 20 GiB RAM tier | `59.254 GB` | `0.53 t/s` | less IO, slower |
+| 24 GiB RAM tier | no final counters | `0.12 t/s` | memory pressure cliff |
+
+The earlier heap-LRU cache design also lost to copy and eviction overhead.
+The zero-copy slab avoids per-hit memcpy, but on this machine a large resident expert slab still competes with the OS, CUDA context, staging buffers, and file cache.
+The native reader also showed PCIe 3.0 storage throughput flattening near `2.38 GB/s` for 16 MiB reads regardless of thread count.
+
+## Build
+
+Install Visual Studio C++ build tools, CUDA, CMake, and Ninja.
+
+```powershell
+git clone https://github.com/koren1712/llama.cpp.git
+cd llama.cpp
+git checkout expert-streaming-win
+
+cmake -S . -B build-stream-cuda -G Ninja `
+  -DCMAKE_BUILD_TYPE=Release `
+  -DGGML_CUDA=ON `
+  -DLLAMA_CURL=OFF
+
+cmake --build build-stream-cuda --config Release --target llama-completion -j 8
+```
+
+## Run
+
+Baseline mmap:
+
+```powershell
+.\build-stream-cuda\bin\llama-completion.exe `
+  -m C:\llama\big-moe-q4.gguf `
+  -ngl 12 `
+  -ot "ffn_.*_exps=CPU" `
+  -c 4096 -n 32 -p "hi" `
+  --no-warmup --temp 0 -no-cnv --simple-io
+```
+
+Persistent read pool + in-op overlap:
+
+```powershell
+$env:LLAMA_EXPERT_STREAMING='1'
+$env:LLAMA_EXPERT_STREAM_CACHE_MB='0'
+$env:LLAMA_EXPERT_STREAM_SLAB_MB='0'
+$env:LLAMA_EXPERT_STREAM_PREFETCH_SLOTS='16'
+$env:LLAMA_EXPERT_STREAM_POOL_THREADS='12'
+
+.\build-stream-cuda\bin\llama-completion.exe `
+  -m C:\llama\big-moe-q4.gguf `
+  -ngl 12 `
+  -ot "ffn_.*_exps=CPU" `
+  -c 4096 -n 32 -p "hi" `
+  --no-warmup --temp 0 -no-cnv --simple-io
+```
+
+Best measured run, with four early expert blocks pinned in VRAM:
+
+```powershell
+$env:LLAMA_EXPERT_STREAMING='1'
+$env:LLAMA_EXPERT_STREAM_CACHE_MB='0'
+$env:LLAMA_EXPERT_STREAM_SLAB_MB='0'
+$env:LLAMA_EXPERT_STREAM_PREFETCH_SLOTS='16'
+$env:LLAMA_EXPERT_STREAM_POOL_THREADS='12'
+
+.\build-stream-cuda\bin\llama-completion.exe `
+  -m C:\llama\big-moe-q4.gguf `
+  -ngl 12 `
+  -ot "blk\.0\.ffn_(up|down|gate|gate_up)_(ch|)exps=CUDA0,blk\.1\.ffn_(up|down|gate|gate_up)_(ch|)exps=CUDA0,blk\.2\.ffn_(up|down|gate|gate_up)_(ch|)exps=CUDA0,blk\.3\.ffn_(up|down|gate|gate_up)_(ch|)exps=CUDA0,\.ffn_(up|down|gate|gate_up)_(ch|)exps=CPU" `
+  -c 4096 -n 32 -p "hi" `
+  --no-warmup --temp 0 -no-cnv --simple-io
+```
+
+At process exit the branch prints counters like:
+
+```text
+LLAMA_EXPERT_STREAMING: registered=135 reads=... bytes=... cache_hits=... pool_threads=...
+```
+
+## Prior Art
+
+- [llama.cpp discussion #23324](https://github.com/ggml-org/llama.cpp/discussions/23324) proposes disk-backed MoE expert paging through compact expert slots and a sidecar loading path.
+- [llama.cpp issue #20757](https://github.com/ggml-org/llama.cpp/issues/20757) proposes a two-tier GPU and pinned-RAM expert cache; the measurements here support avoiding naive heap-cache copies.
+- [flash-moe](https://github.com/danveloper/flash-moe) streams MoE expert weights from NVMe into a Metal inference engine on Apple Silicon.
+- [SP-MoE](https://arxiv.org/abs/2510.10302) combines speculative decoding, expert prefetching, and compute-communication pipelining for MoE inference.
+- [MoE-SpeQ](https://arxiv.org/html/2511.14102v1) uses a small draft model to predict future expert requirements and hide offload latency behind useful computation.
+
+## Upstream README
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)

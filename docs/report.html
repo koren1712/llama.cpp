@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Disk-backed Expert Streaming for Windows/CUDA</title>
+  <style>
+    body { font-family: Arial, sans-serif; line-height: 1.5; margin: 40px auto; max-width: 980px; color: #202124; }
+    h1, h2 { line-height: 1.2; }
+    code { background: #f1f3f4; padding: 0.1rem 0.25rem; border-radius: 3px; }
+    pre { background: #f8f9fa; border: 1px solid #dadce0; padding: 1rem; overflow-x: auto; }
+    table { border-collapse: collapse; width: 100%; margin: 1rem 0 1.5rem; }
+    th, td { border: 1px solid #dadce0; padding: 0.55rem 0.65rem; text-align: left; vertical-align: top; }
+    th { background: #f1f3f4; }
+    .note { background: #fff8e1; border: 1px solid #f6d365; padding: 0.9rem 1rem; }
+  </style>
+</head>
+<body>
+  <h1>Disk-backed Expert Streaming for Windows/CUDA</h1>
+  <p>Status date: 2026-07-04</p>
+  <p>This report documents a local measurement campaign for GLM-4.5-Air Q4_K_M expert streaming in llama.cpp on a Windows/CUDA desktop. The optimized streaming path is measured on Windows/CUDA; non-Windows builds are untested. The branch adds file-offset registration for GGUF expert tensors, a persistent Windows read pool, pointer-returning streaming APIs, in-op read/compute overlap, slab-cache experiments, and VRAM expert spill experiments.</p>
+
+  <h2>Hardware and Model</h2>
+  <table>
+    <tr><th>Item</th><th>Value</th></tr>
+    <tr><td>CPU</td><td>Intel Core i7-8700K</td></tr>
+    <tr><td>GPU</td><td>NVIDIA GeForce RTX 4080 16 GB</td></tr>
+    <tr><td>RAM</td><td>32 GB DDR4-2666</td></tr>
+    <tr><td>NVMe</td><td>WinSAT sequential read 2975.98 MB/s, random read 456.74 MB/s</td></tr>
+    <tr><td>Model</td><td>GLM-4.5-Air Q4_K_M merged GGUF, 73.5 GB file, 67.6 GB expert tensor payload</td></tr>
+    <tr><td>Base commit</td><td><code>c8ae9a750 vendor : update cpp-httplib to 0.49.0 (#25218)</code></td></tr>
+  </table>
+
+  <h2>Measured Results</h2>
+  <table>
+    <tr><th>Variant</th><th>Setting</th><th>Speed</th></tr>
+    <tr><td>baseline mmap</td><td>stock path, expert tensors on CPU</td><td>0.43 t/s</td></tr>
+    <tr><td>persistent async read pool</td><td>8 workers, no slab</td><td>0.65 t/s</td></tr>
+    <tr><td>pool depth sweep</td><td>12 workers, no slab</td><td>0.66 t/s</td></tr>
+    <tr><td>slab expert cache</td><td>16 GiB zero-copy slab</td><td>0.60 t/s</td></tr>
+    <tr><td>RAM-tier hybrid</td><td>20 GiB demand-commit slab</td><td>0.53 t/s</td></tr>
+    <tr><td>RAM-tier hybrid</td><td>24 GiB slab</td><td>0.12 t/s</td></tr>
+    <tr><td>in-op IO/compute overlap</td><td>12 workers, no slab</td><td>0.68 t/s</td></tr>
+    <tr><td>overlap + VRAM expert spill</td><td>expert blocks 0-3 pinned in VRAM</td><td>0.75 t/s</td></tr>
+  </table>
+  <p>Best measured result: <code>0.75 / 0.43 = 1.74x</code>.</p>
+
+  <h2>IO Ladder</h2>
+  <table>
+    <tr><th>Measurement</th><th>Result</th></tr>
+    <tr><td>observed mmap inference read rate</td><td>377 MB/s</td></tr>
+    <tr><td>native 64 KiB random unbuffered read</td><td>287 MB/s</td></tr>
+    <tr><td>native 16 MiB unbuffered read</td><td>2.38 GB/s</td></tr>
+    <tr><td>best pure streaming in generation</td><td>132.045 GB / 47.158 s = 2.80 GB/s</td></tr>
+    <tr><td>WinSAT sequential read</td><td>2.98 GB/s</td></tr>
+  </table>
+  <p>The streaming path reached the NVMe bandwidth range during generation. The remaining wall is bytes per token: the best pure streaming run read <code>132.045 GB / 32 = 4.13 GB/token</code>. With four early expert blocks pinned in VRAM, disk traffic fell to <code>122.356 GB / 32 = 3.82 GB/token</code>.</p>
+
+  <h2>Negative Results</h2>
+  <table>
+    <tr><th>Variant</th><th>Disk bytes</th><th>Speed</th><th>Result</th></tr>
+    <tr><td>no slab, 12 workers</td><td>132.045 GB</td><td>0.66 t/s</td><td>baseline streaming</td></tr>
+    <tr><td>16 GiB slab</td><td>76.025 GB</td><td>0.60 t/s</td><td>less IO, slower</td></tr>
+    <tr><td>20 GiB RAM tier</td><td>59.254 GB</td><td>0.53 t/s</td><td>less IO, slower</td></tr>
+    <tr><td>24 GiB RAM tier</td><td>no final counters</td><td>0.12 t/s</td><td>memory pressure cliff</td></tr>
+  </table>
+  <p>The earlier heap-LRU cache design also lost to copy and eviction overhead. The zero-copy slab avoids per-hit memcpy, but on this machine a large resident expert slab still competes with the OS, CUDA context, staging buffers, and file cache. The native reader also showed PCIe 3.0 storage throughput flattening near 2.38 GB/s for 16 MiB reads regardless of thread count.</p>
+
+  <h2>Build and Run</h2>
+  <pre><code>git clone https://github.com/koren1712/llama.cpp.git
+cd llama.cpp
+git checkout expert-streaming-win
+
+cmake -S . -B build-stream-cuda -G Ninja ^
+  -DCMAKE_BUILD_TYPE=Release ^
+  -DGGML_CUDA=ON ^
+  -DLLAMA_CURL=OFF
+
+cmake --build build-stream-cuda --config Release --target llama-completion -j 8</code></pre>
+
+  <pre><code>$env:LLAMA_EXPERT_STREAMING='1'
+$env:LLAMA_EXPERT_STREAM_CACHE_MB='0'
+$env:LLAMA_EXPERT_STREAM_SLAB_MB='0'
+$env:LLAMA_EXPERT_STREAM_PREFETCH_SLOTS='16'
+$env:LLAMA_EXPERT_STREAM_POOL_THREADS='12'
+
+.\build-stream-cuda\bin\llama-completion.exe `
+  -m C:\llama\big-moe-q4.gguf `
+  -ngl 12 `
+  -ot "ffn_.*_exps=CPU" `
+  -c 4096 -n 32 -p "hi" `
+  --no-warmup --temp 0 -no-cnv --simple-io</code></pre>
+
+  <h2>Decision</h2>
+  <p>The SSD streaming path is real on this machine, but this pass did not reach the original 1.5 t/s target. The best honest number for this model and hardware is 0.75 t/s. The practical next experiments are lower bytes per token, more physical RAM for cache-resident experts, or an execution plan that touches fewer expert tensors per token.</p>
+
+  <div class="note">
+    <strong>Scope:</strong> This report is local measurement data for a fork branch. It does not claim upstream suitability or general performance across hardware.
+  </div>
+</body>
+</html>

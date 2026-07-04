@@ -348,6 +348,57 @@ extern "C" {
     // The correct way to use this API is to discard the deallocated tensors and create new ones.
     GGML_API void                 ggml_backend_sched_reset(ggml_backend_sched_t sched);
 
+    // Experimental file-backed tensor slice streaming.
+    GGML_API void ggml_backend_tensor_stream_register(
+            const struct ggml_tensor * tensor,
+            const char * path,
+            uint64_t offset,
+            uint64_t size);
+
+    GGML_API bool ggml_backend_tensor_stream_read(
+            const struct ggml_tensor * tensor,
+            size_t offset,
+            void * data,
+            size_t size);
+
+    GGML_API int ggml_backend_tensor_stream_read_many(
+            const struct ggml_tensor * tensor,
+            const size_t * offsets,
+            void * data,
+            size_t stride,
+            size_t size,
+            int count,
+            int * success);
+
+    GGML_API int ggml_backend_tensor_stream_read_many_ptr(
+            const struct ggml_tensor * tensor,
+            const size_t * offsets,
+            void * fallback_data,
+            size_t fallback_stride,
+            size_t size,
+            int count,
+            const void ** ptrs,
+            int * success);
+
+    typedef struct ggml_backend_tensor_stream_batch * ggml_backend_tensor_stream_batch_t;
+
+    GGML_API ggml_backend_tensor_stream_batch_t ggml_backend_tensor_stream_read_many_ptr_async(
+            const struct ggml_tensor * tensor,
+            const size_t * offsets,
+            void * fallback_data,
+            size_t fallback_stride,
+            size_t size,
+            int count,
+            const void ** ptrs,
+            int * status);
+
+    GGML_API bool ggml_backend_tensor_stream_batch_wait(
+            ggml_backend_tensor_stream_batch_t batch,
+            int index);
+
+    GGML_API void ggml_backend_tensor_stream_batch_free(
+            ggml_backend_tensor_stream_batch_t batch);
+
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 

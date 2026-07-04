@@ -14,18 +14,697 @@
 #include "ggml-impl.h"
 
 #include <assert.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 #ifdef __APPLE__
 #include <sys/types.h>
 #include <sys/sysctl.h>
 #endif
+
+struct ggml_backend_tensor_stream_source {
+    std::string path;
+    uint64_t offset;
+    uint64_t size;
+};
+
+struct ggml_backend_tensor_stream_cache_key {
+    const ggml_tensor * tensor;
+    size_t offset;
+    size_t size;
+
+    bool operator==(const ggml_backend_tensor_stream_cache_key & other) const {
+        return tensor == other.tensor && offset == other.offset && size == other.size;
+    }
+};
+
+struct ggml_backend_tensor_stream_cache_key_hash {
+    size_t operator()(const ggml_backend_tensor_stream_cache_key & key) const {
+        size_t h = (size_t) key.tensor;
+        h ^= key.offset + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+        h ^= key.size   + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+struct ggml_backend_tensor_stream_cache_entry {
+    uint8_t * data;
+    size_t size;
+    uint64_t last_use;
+};
+
+struct ggml_backend_tensor_stream_task_batch {
+    std::mutex mutex;
+    std::condition_variable cv;
+    int remaining = 0;
+};
+
+struct ggml_backend_tensor_stream_task {
+    const ggml_tensor * tensor;
+    size_t offset;
+    void * data;
+    size_t size;
+    int * success;
+    std::shared_ptr<ggml_backend_tensor_stream_task_batch> batch;
+};
+
+struct ggml_backend_tensor_stream_batch {
+    std::shared_ptr<ggml_backend_tensor_stream_task_batch> batch;
+    std::vector<int> local_status;
+    int * status;
+    int count;
+};
+
+static std::mutex g_tensor_stream_mutex;
+static std::unordered_map<const ggml_tensor *, ggml_backend_tensor_stream_source> g_tensor_stream_sources;
+static std::unordered_map<
+    ggml_backend_tensor_stream_cache_key,
+    ggml_backend_tensor_stream_cache_entry,
+    ggml_backend_tensor_stream_cache_key_hash> g_tensor_stream_cache;
+static uint64_t g_tensor_stream_cache_clock = 0;
+static uint64_t g_tensor_stream_cache_bytes = 0;
+static uint8_t * g_tensor_stream_slab = nullptr;
+static uint64_t g_tensor_stream_slab_limit = 0;
+static uint64_t g_tensor_stream_slab_used = 0;
+static std::once_flag g_tensor_stream_report_once;
+static std::once_flag g_tensor_stream_pool_once;
+static std::atomic<uint64_t> g_tensor_stream_registered{0};
+static std::atomic<uint64_t> g_tensor_stream_reads{0};
+static std::atomic<uint64_t> g_tensor_stream_bytes{0};
+static std::atomic<uint64_t> g_tensor_stream_cache_hits{0};
+static std::atomic<uint64_t> g_tensor_stream_slab_stores{0};
+static std::atomic<uint64_t> g_tensor_stream_fallback_reads{0};
+static std::atomic<uint64_t> g_tensor_stream_failures{0};
+static std::mutex g_tensor_stream_pool_mutex;
+static std::condition_variable g_tensor_stream_pool_cv;
+static std::deque<ggml_backend_tensor_stream_task> g_tensor_stream_pool_tasks;
+static std::vector<std::thread> g_tensor_stream_pool_workers;
+static bool g_tensor_stream_pool_stop = false;
+
+static uint64_t ggml_backend_tensor_stream_cache_limit(void) {
+    const char * env = getenv("LLAMA_EXPERT_STREAM_CACHE_MB");
+    const uint64_t mb = env && env[0] ? (uint64_t) strtoull(env, nullptr, 10) : 0ull;
+    return mb * 1024ull * 1024ull;
+}
+
+static uint64_t ggml_backend_tensor_stream_slab_limit(void) {
+    const char * env = getenv("LLAMA_EXPERT_STREAM_SLAB_MB");
+    const uint64_t mb = env && env[0] ? (uint64_t) strtoull(env, nullptr, 10) : 0ull;
+    return mb * 1024ull * 1024ull;
+}
+
+static int ggml_backend_tensor_stream_pool_threads(void) {
+    const char * env_pool = getenv("LLAMA_EXPERT_STREAM_POOL_THREADS");
+    const char * env_read = getenv("LLAMA_EXPERT_STREAM_READ_THREADS");
+    const char * env = env_pool && env_pool[0] ? env_pool : env_read;
+    int n_threads = env && env[0] ? atoi(env) : 8;
+    return std::max(1, std::min(n_threads, 32));
+}
+
+static uint64_t ggml_backend_tensor_stream_pad64(uint64_t size) {
+    return (size + 63ull) & ~63ull;
+}
+
+static uint64_t ggml_backend_tensor_stream_pad_page(uint64_t size) {
+    return (size + 4095ull) & ~4095ull;
+}
+
+static bool ggml_backend_tensor_stream_cache_try_read(
+        const ggml_tensor * tensor,
+        size_t offset,
+        const void ** data,
+        size_t size,
+        uint64_t limit) {
+    if (limit == 0 || size == 0 || size > limit) {
+        return false;
+    }
+
+    const ggml_backend_tensor_stream_cache_key key{tensor, offset, size};
+
+    std::lock_guard<std::mutex> lock(g_tensor_stream_mutex);
+    auto it = g_tensor_stream_cache.find(key);
+    if (it == g_tensor_stream_cache.end()) {
+        return false;
+    }
+
+    *data = it->second.data;
+    it->second.last_use = ++g_tensor_stream_cache_clock;
+    g_tensor_stream_cache_hits++;
+    return true;
+}
+
+static uint8_t * ggml_backend_tensor_stream_slab_alloc_locked(size_t size) {
+    const uint64_t limit = ggml_backend_tensor_stream_slab_limit();
+    if (limit == 0 || size == 0 || size > limit) {
+        return nullptr;
+    }
+
+    if (g_tensor_stream_slab == nullptr || g_tensor_stream_slab_limit != limit) {
+#ifdef _WIN32
+        g_tensor_stream_slab = (uint8_t *) VirtualAlloc(NULL, limit, MEM_RESERVE, PAGE_READWRITE);
+#else
+        g_tensor_stream_slab = (uint8_t *) malloc(limit);
+#endif
+        g_tensor_stream_slab_limit = g_tensor_stream_slab != nullptr ? limit : 0;
+        g_tensor_stream_slab_used = 0;
+    }
+
+    if (g_tensor_stream_slab == nullptr) {
+        return nullptr;
+    }
+
+    const uint64_t padded = ggml_backend_tensor_stream_pad_page(size);
+    if (g_tensor_stream_slab_used + padded > g_tensor_stream_slab_limit) {
+        return nullptr;
+    }
+
+    uint8_t * ptr = g_tensor_stream_slab + g_tensor_stream_slab_used;
+#ifdef _WIN32
+    if (VirtualAlloc(ptr, padded, MEM_COMMIT, PAGE_READWRITE) == nullptr) {
+        return nullptr;
+    }
+#endif
+    g_tensor_stream_slab_used += padded;
+    return ptr;
+}
+
+static uint8_t * ggml_backend_tensor_stream_cache_reserve(
+        const ggml_tensor * tensor,
+        size_t offset,
+        size_t size,
+        uint64_t limit) {
+    if (limit == 0 || size == 0 || size > limit) {
+        return nullptr;
+    }
+
+    const ggml_backend_tensor_stream_cache_key key{tensor, offset, size};
+
+    std::lock_guard<std::mutex> lock(g_tensor_stream_mutex);
+
+    if (g_tensor_stream_cache.find(key) != g_tensor_stream_cache.end()) {
+        return nullptr;
+    }
+
+    uint8_t * ptr = ggml_backend_tensor_stream_slab_alloc_locked(size);
+    if (ptr == nullptr) {
+        return nullptr;
+    }
+
+    ggml_backend_tensor_stream_cache_entry entry;
+    entry.data = ptr;
+    entry.size = size;
+    entry.last_use = ++g_tensor_stream_cache_clock;
+
+    g_tensor_stream_cache_bytes += size;
+    g_tensor_stream_cache.emplace(key, std::move(entry));
+    g_tensor_stream_slab_stores++;
+    return ptr;
+}
+
+static bool ggml_backend_tensor_stream_read_raw(
+        const struct ggml_tensor * tensor,
+        size_t offset,
+        void * data,
+        size_t size);
+
+static void ggml_backend_tensor_stream_pool_worker(void) {
+    for (;;) {
+        ggml_backend_tensor_stream_task task;
+        {
+            std::unique_lock<std::mutex> lock(g_tensor_stream_pool_mutex);
+            g_tensor_stream_pool_cv.wait(lock, [] {
+                return g_tensor_stream_pool_stop || !g_tensor_stream_pool_tasks.empty();
+            });
+            if (g_tensor_stream_pool_stop && g_tensor_stream_pool_tasks.empty()) {
+                return;
+            }
+            task = std::move(g_tensor_stream_pool_tasks.front());
+            g_tensor_stream_pool_tasks.pop_front();
+        }
+
+        const bool ok = ggml_backend_tensor_stream_read_raw(task.tensor, task.offset, task.data, task.size);
+        if (task.success != nullptr) {
+            *task.success = ok ? 1 : -1;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(task.batch->mutex);
+            task.batch->remaining--;
+            task.batch->cv.notify_all();
+        }
+    }
+}
+
+static void ggml_backend_tensor_stream_pool_shutdown(void) {
+    {
+        std::lock_guard<std::mutex> lock(g_tensor_stream_pool_mutex);
+        g_tensor_stream_pool_stop = true;
+    }
+    g_tensor_stream_pool_cv.notify_all();
+    for (std::thread & worker : g_tensor_stream_pool_workers) {
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+}
+
+static void ggml_backend_tensor_stream_pool_init(void) {
+    const int n_threads = ggml_backend_tensor_stream_pool_threads();
+    g_tensor_stream_pool_workers.reserve(n_threads);
+    for (int i = 0; i < n_threads; ++i) {
+        g_tensor_stream_pool_workers.emplace_back(ggml_backend_tensor_stream_pool_worker);
+    }
+    atexit(ggml_backend_tensor_stream_pool_shutdown);
+}
+
+static void ggml_backend_tensor_stream_pool_submit(
+        const std::vector<ggml_backend_tensor_stream_task> & tasks,
+        const std::shared_ptr<ggml_backend_tensor_stream_task_batch> & batch) {
+    if (tasks.empty()) {
+        return;
+    }
+
+    std::call_once(g_tensor_stream_pool_once, ggml_backend_tensor_stream_pool_init);
+
+    {
+        std::lock_guard<std::mutex> lock(g_tensor_stream_pool_mutex);
+        batch->remaining = (int) tasks.size();
+        for (const ggml_backend_tensor_stream_task & task : tasks) {
+            g_tensor_stream_pool_tasks.push_back(task);
+        }
+    }
+    g_tensor_stream_pool_cv.notify_all();
+
+    std::unique_lock<std::mutex> lock(batch->mutex);
+    batch->cv.wait(lock, [&] {
+        return batch->remaining == 0;
+    });
+}
+
+static void ggml_backend_tensor_stream_pool_enqueue(
+        const std::vector<ggml_backend_tensor_stream_task> & tasks,
+        const std::shared_ptr<ggml_backend_tensor_stream_task_batch> & batch) {
+    if (tasks.empty()) {
+        return;
+    }
+
+    std::call_once(g_tensor_stream_pool_once, ggml_backend_tensor_stream_pool_init);
+
+    {
+        std::lock_guard<std::mutex> lock(g_tensor_stream_pool_mutex);
+        batch->remaining = (int) tasks.size();
+        for (const ggml_backend_tensor_stream_task & task : tasks) {
+            g_tensor_stream_pool_tasks.push_back(task);
+        }
+    }
+    g_tensor_stream_pool_cv.notify_all();
+}
+
+static void ggml_backend_tensor_stream_report(void) {
+    if (g_tensor_stream_registered.load() == 0 &&
+            g_tensor_stream_reads.load() == 0 &&
+            g_tensor_stream_failures.load() == 0) {
+        return;
+    }
+
+    fprintf(stderr,
+            "LLAMA_EXPERT_STREAMING: registered=%" PRIu64 " reads=%" PRIu64 " bytes=%.3f GB cache_hits=%" PRIu64 " slab_stores=%" PRIu64 " fallback_reads=%" PRIu64 " cache=%.3f GB slab_used=%.3f GB entries=%zu pool_threads=%d failures=%" PRIu64 "\n",
+            g_tensor_stream_registered.load(),
+            g_tensor_stream_reads.load(),
+            (double) g_tensor_stream_bytes.load() / 1e9,
+            g_tensor_stream_cache_hits.load(),
+            g_tensor_stream_slab_stores.load(),
+            g_tensor_stream_fallback_reads.load(),
+            (double) g_tensor_stream_cache_bytes / 1e9,
+            (double) g_tensor_stream_slab_used / 1e9,
+            g_tensor_stream_cache.size(),
+            ggml_backend_tensor_stream_pool_threads(),
+            g_tensor_stream_failures.load());
+}
+
+#ifdef _WIN32
+static std::unordered_map<std::string, HANDLE> g_tensor_stream_handles;
+
+static HANDLE ggml_backend_tensor_stream_get_handle_locked(const std::string & path) {
+    auto it = g_tensor_stream_handles.find(path);
+    if (it != g_tensor_stream_handles.end()) {
+        return it->second;
+    }
+
+    HANDLE h = CreateFileA(
+            path.c_str(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            NULL,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED | FILE_FLAG_RANDOM_ACCESS,
+            NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        return INVALID_HANDLE_VALUE;
+    }
+
+    g_tensor_stream_handles.emplace(path, h);
+    return h;
+}
+#endif
+
+void ggml_backend_tensor_stream_register(
+        const struct ggml_tensor * tensor,
+        const char * path,
+        uint64_t offset,
+        uint64_t size) {
+    if (tensor == nullptr || path == nullptr || path[0] == '\0') {
+        return;
+    }
+
+    std::call_once(g_tensor_stream_report_once, [] {
+        atexit(ggml_backend_tensor_stream_report);
+    });
+
+    std::lock_guard<std::mutex> lock(g_tensor_stream_mutex);
+    g_tensor_stream_sources[tensor] = ggml_backend_tensor_stream_source{path, offset, size};
+    g_tensor_stream_registered++;
+}
+
+bool ggml_backend_tensor_stream_read(
+        const struct ggml_tensor * tensor,
+        size_t offset,
+        void * data,
+        size_t size) {
+    const void * cached = nullptr;
+    const uint64_t cache_limit = ggml_backend_tensor_stream_cache_limit();
+    if (ggml_backend_tensor_stream_cache_try_read(tensor, offset, &cached, size, cache_limit)) {
+        memcpy(data, cached, size);
+        return true;
+    }
+
+    const bool ok = ggml_backend_tensor_stream_read_raw(tensor, offset, data, size);
+    if (ok && cache_limit > 0) {
+        uint8_t * slot = ggml_backend_tensor_stream_cache_reserve(tensor, offset, size, cache_limit);
+        if (slot != nullptr) {
+            memcpy(slot, data, size);
+        }
+    }
+    return ok;
+}
+
+static bool ggml_backend_tensor_stream_read_raw(
+        const struct ggml_tensor * tensor,
+        size_t offset,
+        void * data,
+        size_t size) {
+    if (tensor == nullptr || data == nullptr) {
+        g_tensor_stream_failures++;
+        return false;
+    }
+
+    ggml_backend_tensor_stream_source src;
+    {
+        std::lock_guard<std::mutex> lock(g_tensor_stream_mutex);
+        auto it = g_tensor_stream_sources.find(tensor);
+        if (it == g_tensor_stream_sources.end()) {
+            g_tensor_stream_failures++;
+            return false;
+        }
+        src = it->second;
+    }
+
+    if ((uint64_t) offset + (uint64_t) size < (uint64_t) offset ||
+            (uint64_t) offset + (uint64_t) size > src.size) {
+        g_tensor_stream_failures++;
+        return false;
+    }
+
+    const uint64_t file_offset = src.offset + (uint64_t) offset;
+
+#ifdef _WIN32
+    HANDLE h = INVALID_HANDLE_VALUE;
+    {
+        std::lock_guard<std::mutex> lock(g_tensor_stream_mutex);
+        h = ggml_backend_tensor_stream_get_handle_locked(src.path);
+    }
+    if (h == INVALID_HANDLE_VALUE) {
+        g_tensor_stream_failures++;
+        return false;
+    }
+
+    OVERLAPPED ov = {};
+    ov.Offset     = (DWORD) (file_offset & 0xffffffffu);
+    ov.OffsetHigh = (DWORD) (file_offset >> 32);
+    ov.hEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
+    if (ov.hEvent == NULL) {
+        g_tensor_stream_failures++;
+        return false;
+    }
+
+    uint8_t * dst = (uint8_t *) data;
+    size_t done = 0;
+    bool ok_all = true;
+    while (done < size) {
+        const DWORD want = (DWORD) std::min<size_t>(size - done, 64ull * 1024ull * 1024ull);
+        const uint64_t cur_off = file_offset + done;
+        ov.Offset     = (DWORD) (cur_off & 0xffffffffu);
+        ov.OffsetHigh = (DWORD) (cur_off >> 32);
+        ResetEvent(ov.hEvent);
+
+        DWORD got = 0;
+        BOOL ok = ReadFile(h, dst + done, want, NULL, &ov);
+        if (!ok) {
+            const DWORD err = GetLastError();
+            if (err != ERROR_IO_PENDING) {
+                ok_all = false;
+                break;
+            }
+        }
+        ok = GetOverlappedResult(h, &ov, &got, TRUE);
+        if (!ok || got != want) {
+            ok_all = false;
+            break;
+        }
+        done += got;
+    }
+
+    CloseHandle(ov.hEvent);
+    if (ok_all) {
+        g_tensor_stream_reads++;
+        g_tensor_stream_bytes += size;
+    } else {
+        g_tensor_stream_failures++;
+    }
+    return ok_all;
+#else
+    FILE * f = fopen(src.path.c_str(), "rb");
+    if (f == nullptr) {
+        g_tensor_stream_failures++;
+        return false;
+    }
+    if (fseek(f, (long) file_offset, SEEK_SET) != 0) {
+        fclose(f);
+        g_tensor_stream_failures++;
+        return false;
+    }
+    const bool ok = fread(data, 1, size, f) == size;
+    fclose(f);
+    if (ok) {
+        g_tensor_stream_reads++;
+        g_tensor_stream_bytes += size;
+    } else {
+        g_tensor_stream_failures++;
+    }
+    return ok;
+#endif
+}
+
+int ggml_backend_tensor_stream_read_many(
+        const struct ggml_tensor * tensor,
+        const size_t * offsets,
+        void * data,
+        size_t stride,
+        size_t size,
+        int count,
+        int * success) {
+    if (tensor == nullptr || offsets == nullptr || data == nullptr || count <= 0) {
+        return 0;
+    }
+
+    const char * env = getenv("LLAMA_EXPERT_STREAM_READ_THREADS");
+    int n_threads = env && env[0] ? atoi(env) : 4;
+    n_threads = std::max(1, std::min(n_threads, count));
+
+    if (success != nullptr) {
+        memset(success, 0, (size_t) count * sizeof(int));
+    }
+
+    uint8_t * base = (uint8_t *) data;
+    std::vector<ggml_backend_tensor_stream_task> tasks;
+    tasks.reserve(count);
+    std::vector<int> local_success((size_t) count, 0);
+    for (int i = 0; i < count; ++i) {
+        tasks.push_back(ggml_backend_tensor_stream_task{
+                tensor,
+                offsets[i],
+                base + (size_t) i * stride,
+                size,
+                success != nullptr ? &success[i] : &local_success[i],
+                nullptr});
+    }
+
+    auto batch = std::make_shared<ggml_backend_tensor_stream_task_batch>();
+    for (ggml_backend_tensor_stream_task & task : tasks) {
+        task.batch = batch;
+    }
+    ggml_backend_tensor_stream_pool_submit(tasks, batch);
+
+    int ok_count = 0;
+    for (int i = 0; i < count; ++i) {
+        if (success != nullptr) {
+            ok_count += success[i] > 0 ? 1 : 0;
+            success[i] = success[i] > 0 ? 1 : 0;
+        } else {
+            ok_count += local_success[i] > 0 ? 1 : 0;
+        }
+    }
+
+    (void) n_threads;
+    return ok_count;
+}
+
+ggml_backend_tensor_stream_batch_t ggml_backend_tensor_stream_read_many_ptr_async(
+        const struct ggml_tensor * tensor,
+        const size_t * offsets,
+        void * fallback_data,
+        size_t fallback_stride,
+        size_t size,
+        int count,
+        const void ** ptrs,
+        int * success) {
+    if (tensor == nullptr || offsets == nullptr || fallback_data == nullptr || ptrs == nullptr || count <= 0) {
+        return nullptr;
+    }
+
+    memset(ptrs, 0, (size_t) count * sizeof(void *));
+
+    ggml_backend_tensor_stream_batch * handle = new ggml_backend_tensor_stream_batch;
+    handle->batch = std::make_shared<ggml_backend_tensor_stream_task_batch>();
+    handle->local_status.assign((size_t) count, 0);
+    handle->status = success != nullptr ? success : handle->local_status.data();
+    handle->count = count;
+    memset(handle->status, 0, (size_t) count * sizeof(int));
+
+    const uint64_t slab_limit = ggml_backend_tensor_stream_slab_limit();
+    uint8_t * fallback_base = (uint8_t *) fallback_data;
+
+    std::vector<ggml_backend_tensor_stream_task> tasks;
+    tasks.reserve(count);
+    std::vector<int> task_indices;
+    task_indices.reserve(count);
+
+    for (int i = 0; i < count; ++i) {
+        const void * cached = nullptr;
+        if (ggml_backend_tensor_stream_cache_try_read(tensor, offsets[i], &cached, size, slab_limit)) {
+            ptrs[i] = cached;
+            handle->status[i] = 1;
+            continue;
+        }
+
+        uint8_t * dst = ggml_backend_tensor_stream_cache_reserve(tensor, offsets[i], size, slab_limit);
+        if (dst == nullptr) {
+            dst = fallback_base + (size_t) i * fallback_stride;
+            g_tensor_stream_fallback_reads++;
+        }
+
+        ptrs[i] = dst;
+        task_indices.push_back(i);
+        tasks.push_back(ggml_backend_tensor_stream_task{
+                tensor,
+                offsets[i],
+                dst,
+                size,
+                &handle->status[i],
+                handle->batch});
+    }
+
+    if (!tasks.empty()) {
+        ggml_backend_tensor_stream_pool_enqueue(tasks, handle->batch);
+    }
+
+    (void) task_indices;
+    return handle;
+}
+
+bool ggml_backend_tensor_stream_batch_wait(
+        ggml_backend_tensor_stream_batch_t batch,
+        int index) {
+    if (batch == nullptr || index < 0 || index >= batch->count) {
+        return false;
+    }
+
+    if (batch->status[index] == 0) {
+        std::unique_lock<std::mutex> lock(batch->batch->mutex);
+        batch->batch->cv.wait(lock, [&] {
+            return batch->status[index] != 0 || batch->batch->remaining == 0;
+        });
+    }
+
+    return batch->status[index] > 0;
+}
+
+void ggml_backend_tensor_stream_batch_free(ggml_backend_tensor_stream_batch_t batch) {
+    if (batch == nullptr) {
+        return;
+    }
+    {
+        std::unique_lock<std::mutex> lock(batch->batch->mutex);
+        batch->batch->cv.wait(lock, [&] {
+            return batch->batch->remaining == 0;
+        });
+    }
+    delete batch;
+}
+
+int ggml_backend_tensor_stream_read_many_ptr(
+        const struct ggml_tensor * tensor,
+        const size_t * offsets,
+        void * fallback_data,
+        size_t fallback_stride,
+        size_t size,
+        int count,
+        const void ** ptrs,
+        int * success) {
+    ggml_backend_tensor_stream_batch_t batch =
+        ggml_backend_tensor_stream_read_many_ptr_async(tensor, offsets, fallback_data, fallback_stride, size, count, ptrs, success);
+    if (batch == nullptr) {
+        return 0;
+    }
+    ggml_backend_tensor_stream_batch_free(batch);
+
+    int ok_count = 0;
+    for (int i = 0; i < count; ++i) {
+        if (success != nullptr) {
+            if (success[i] < 0) {
+                success[i] = 0;
+            }
+            ok_count += success[i] > 0 ? 1 : 0;
+        } else {
+            ok_count += ptrs[i] != nullptr ? 1 : 0;
+        }
+    }
+    return ok_count;
+}
 
 
 // backend buffer type
@@ -1626,13 +2305,25 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
                         const size_t padding = std::min<size_t>(expert_size, 512);
                         const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
+                        const size_t size_copy = expert_size_copy + padding_end;
+
+                        const char * stream_env = getenv("LLAMA_EXPERT_STREAMING");
+                        const bool stream_experts = stream_env && strcmp(stream_env, "0") != 0;
+
+                        if (stream_experts) {
+                            std::vector<uint8_t> streamed(size_copy);
+                            if (ggml_backend_tensor_stream_read(input, expert_offset, streamed.data(), size_copy)) {
+                                ggml_backend_tensor_set(input_cpy, streamed.data(), expert_offset, size_copy);
+                                return;
+                            }
+                        }
 
                         ggml_backend_tensor_set_async(split_backend,
-                            input_cpy,
-                            (const uint8_t *)input->data + expert_offset, expert_offset,
-                            // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
-                            // this is necessary for MMQ in the CUDA backend
-                            expert_size_copy + padding_end);
+                                input_cpy,
+                                (const uint8_t *)input->data + expert_offset, expert_offset,
+                                // copy a bit extra at the end to ensure there are no NaNs in the padding of the last expert
+                                // this is necessary for MMQ in the CUDA backend
+                                size_copy);
                     };
 
                     int id = 0;
